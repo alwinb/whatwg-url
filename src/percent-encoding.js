@@ -73,6 +73,10 @@ function isPathPercentEncode(c) {
   return isQueryPercentEncode(c) || extraPathPercentEncodeSet.has(c);
 }
 
+function isPathPartPercentEncode(c) {
+  return c !== p('/') && isQueryPercentEncode(c) || extraPathPercentEncodeSet.has(c);
+}
+
 // https://url.spec.whatwg.org/#userinfo-percent-encode-set
 const extraUserinfoPercentEncodeSet =
   new Set([p("/"), p(":"), p(";"), p("="), p("@"), p("["), p("\\"), p("]"), p("^"), p("|")]);
@@ -136,6 +140,7 @@ module.exports = {
   isQueryPercentEncode,
   isSpecialQueryPercentEncode,
   isPathPercentEncode,
+  isPathPartPercentEncode,
   isUserinfoPercentEncode,
   isURLEncodedPercentEncode,
   percentDecodeString,

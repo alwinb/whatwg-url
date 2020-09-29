@@ -2,29 +2,23 @@
 const usm = require("./url-state-machine");
 const urlencoded = require("./urlencoded");
 const URLSearchParams = require("./URLSearchParams");
+const log = console.log.bind (console)
 
 exports.implementation = class URLImpl {
   constructor(globalObject, constructorArgs) {
     const url = constructorArgs[0];
     const base = constructorArgs[1];
 
-    let parsedBase = null;
-    if (base !== undefined) {
-      parsedBase = usm.basicURLParse(base);
-      if (parsedBase === null) {
-        throw new TypeError(`Invalid base URL: ${base}`);
-      }
+    if (base == null)
+      this._url = usm.parseAndResolveURL (url)
+
+    else {
+      const baseURL = usm.parseAndResolveURL (base)
+      if (!baseURL.scheme) throw new TypeError (`Invalid base URL <${baseURL}>`)
+      this._url = usm.parseAndResolveURL (url, baseURL)
     }
 
-    const parsedURL = usm.basicURLParse(url, { baseURL: parsedBase });
-    if (parsedURL === null) {
-      throw new TypeError(`Invalid URL: ${url}`);
-    }
-
-    const query = parsedURL.query !== null ? parsedURL.query : "";
-
-    this._url = parsedURL;
-
+    const query = this._url.query !== null ? this._url.query : "";
     // We cannot invoke the "new URLSearchParams object" algorithm without going through the constructor, which strips
     // question mark by default. Therefore the doNotStripQMark hack is used.
     this._query = URLSearchParams.createImpl(globalObject, [query], { doNotStripQMark: true });
@@ -59,30 +53,30 @@ exports.implementation = class URLImpl {
   }
 
   set protocol(v) {
-    usm.basicURLParse(v + ":", { url: this._url, stateOverride: "scheme start" });
+    usm.setTheScheme(this._url, v + ":");
   }
 
   get username() {
+    if (this._url.username === null) {
+      return "";
+    }
+
     return this._url.username;
   }
 
   set username(v) {
-    if (usm.cannotHaveAUsernamePasswordPort(this._url)) {
-      return;
-    }
-
     usm.setTheUsername(this._url, v);
   }
 
   get password() {
+    if (this._url.password === null) {
+      return "";
+    }
+
     return this._url.password;
   }
 
   set password(v) {
-    if (usm.cannotHaveAUsernamePasswordPort(this._url)) {
-      return;
-    }
-
     usm.setThePassword(this._url, v);
   }
 
@@ -101,11 +95,7 @@ exports.implementation = class URLImpl {
   }
 
   set host(v) {
-    if (this._url.cannotBeABaseURL) {
-      return;
-    }
-
-    usm.basicURLParse(v, { url: this._url, stateOverride: "host" });
+    usm.setTheHost(this._url, v);
   }
 
   get hostname() {
@@ -117,11 +107,7 @@ exports.implementation = class URLImpl {
   }
 
   set hostname(v) {
-    if (this._url.cannotBeABaseURL) {
-      return;
-    }
-
-    usm.basicURLParse(v, { url: this._url, stateOverride: "hostname" });
+    usm.setTheHostName(this._url, v);
   }
 
   get port() {
@@ -133,27 +119,11 @@ exports.implementation = class URLImpl {
   }
 
   set port(v) {
-    if (usm.cannotHaveAUsernamePasswordPort(this._url)) {
-      return;
-    }
-
-    if (v === "") {
-      this._url.port = null;
-    } else {
-      usm.basicURLParse(v, { url: this._url, stateOverride: "port" });
-    }
+    usm.setThePort (this._url, v);
   }
 
   get pathname() {
-    if (this._url.cannotBeABaseURL) {
-      return this._url.path[0];
-    }
-
-    if (this._url.path.length === 0) {
-      return "";
-    }
-
-    return "/" + this._url.path.join("/");
+    return usm.serializePath(this._url);
   }
 
   set pathname(v) {
@@ -162,7 +132,7 @@ exports.implementation = class URLImpl {
     }
 
     this._url.path = [];
-    usm.basicURLParse(v, { url: this._url, stateOverride: "path start" });
+    usm.setThePathName(this._url, v);
   }
 
   get search() {
@@ -184,7 +154,7 @@ exports.implementation = class URLImpl {
 
     const input = v[0] === "?" ? v.substring(1) : v;
     url.query = "";
-    usm.basicURLParse(input, { url, stateOverride: "query" });
+    usm.setTheQuery(this._url, input);
     this._query._list = urlencoded.parseUrlencodedString(input);
   }
 
@@ -208,7 +178,7 @@ exports.implementation = class URLImpl {
 
     const input = v[0] === "#" ? v.substring(1) : v;
     this._url.fragment = "";
-    usm.basicURLParse(input, { url: this._url, stateOverride: "fragment" });
+    usm.setTheFragment(this._url, input);
   }
 
   toJSON() {

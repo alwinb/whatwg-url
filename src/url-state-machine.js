@@ -1,31 +1,20 @@
 "use strict";
 const punycode = require("punycode");
 const tr46 = require("tr46");
+const log = console.log.bind (console)
 
 const infra = require("./infra");
+const { isASCIIAlpha:isAlpha, isASCIIDigit:isDigit } = infra
 const { utf8DecodeWithoutBOM } = require("./encoding");
 const { percentDecodeString, utf8PercentEncodeCodePoint, utf8PercentEncodeString, isC0ControlPercentEncode,
   isFragmentPercentEncode, isQueryPercentEncode, isSpecialQueryPercentEncode, isPathPercentEncode,
-  isUserinfoPercentEncode } = require("./percent-encoding");
+  isUserinfoPercentEncode, isPathPartPercentEncode } = require("./percent-encoding");
 
 function p(char) {
   return char.codePointAt(0);
 }
 
-const specialSchemes = {
-  ftp: 21,
-  file: null,
-  http: 80,
-  https: 443,
-  ws: 80,
-  wss: 443
-};
-
 const failure = Symbol("failure");
-
-function countSymbols(str) {
-  return [...str].length;
-}
 
 function at(input, idx) {
   const c = input[idx];
@@ -41,16 +30,8 @@ function isDoubleDot(buffer) {
   return buffer === ".." || buffer === "%2e." || buffer === ".%2e" || buffer === "%2e%2e";
 }
 
-function isWindowsDriveLetterCodePoints(cp1, cp2) {
-  return infra.isASCIIAlpha(cp1) && (cp2 === p(":") || cp2 === p("|"));
-}
-
 function isWindowsDriveLetterString(string) {
   return string.length === 2 && infra.isASCIIAlpha(string.codePointAt(0)) && (string[1] === ":" || string[1] === "|");
-}
-
-function isNormalizedWindowsDriveLetterString(string) {
-  return string.length === 2 && infra.isASCIIAlpha(string.codePointAt(0)) && string[1] === ":";
 }
 
 function containsForbiddenHostCodePoint(string) {
@@ -430,20 +411,8 @@ function trimTabAndNewline(url) {
   return url.replace(/\u0009|\u000A|\u000D/g, "");
 }
 
-function shortenPath(url) {
-  const { path } = url;
-  if (path.length === 0) {
-    return;
-  }
-  if (url.scheme === "file" && path.length === 1 && isNormalizedWindowsDriveLetter(path[0])) {
-    return;
-  }
-
-  path.pop();
-}
-
-function includesCredentials(url) {
-  return url.username !== "" || url.password !== "";
+function includesCredentials(url){
+  return url.username !== "" || url.password !== ""; // REVIEW
 }
 
 function cannotHaveAUsernamePasswordPort(url) {
@@ -454,703 +423,696 @@ function isNormalizedWindowsDriveLetter(string) {
   return /^[A-Za-z]:$/.test(string);
 }
 
-function URLStateMachine(input, base, encodingOverride, url, stateOverride) {
-  this.pointer = 0;
-  this.input = input;
-  this.base = base || null;
-  this.encodingOverride = encodingOverride || "utf-8";
-  this.stateOverride = stateOverride;
-  this.url = url;
-  this.failure = false;
-  this.parseError = false;
 
-  if (!this.url) {
-    this.url = {
-      scheme: "",
-      username: "",
-      password: "",
-      host: null,
-      port: null,
-      path: [],
-      query: null,
-      fragment: null,
+// URL Model
+// ---------
 
-      cannotBeABaseURL: false
-    };
+// parserModes are needed for parsing relative URLs
+// They specify the scheme-dependent behaviour to use when parsing scheme-less URL-strings. 
 
-    const res = trimControlChars(this.input);
-    if (res !== this.input) {
-      this.parseError = true;
-    }
-    this.input = res;
-  }
+const specialSchemes =
+  { ftp: 21, file: null, http: 80, https: 443, ws: 80, wss: 443 };
 
-  const res = trimTabAndNewline(this.input);
-  if (res !== this.input) {
-    this.parseError = true;
-  }
-  this.input = res;
+const parserModes = 
+  { file: Symbol('file'), web: Symbol('web'), nonSpecial: Symbol('nonSpecial') }
 
-  this.state = stateOverride || "scheme start";
-
-  this.buffer = "";
-  this.atFlag = false;
-  this.arrFlag = false;
-  this.passwordTokenSeenFlag = false;
-
-  this.input = punycode.ucs2.decode(this.input);
-
-  for (; this.pointer <= this.input.length; ++this.pointer) {
-    const c = this.input[this.pointer];
-    const cStr = isNaN(c) ? undefined : String.fromCodePoint(c);
-
-    // exec state machine
-    const ret = this["parse " + this.state](c, cStr);
-    if (!ret) {
-      break; // terminate algorithm
-    } else if (ret === failure) {
-      this.failure = true;
-      break;
-    }
-  }
+function parserModeFor (url) {
+  return url == null || url._scheme == null ? parserModes.web
+    : url._scheme === 'file' ? parserModes.file
+    : url._scheme in specialSchemes ? parserModes.web
+    : parserModes.nonSpecial
 }
 
-URLStateMachine.prototype["parse scheme start"] = function parseSchemeStart(c, cStr) {
-  if (infra.isASCIIAlpha(c)) {
-    this.buffer += cStr.toLowerCase();
-    this.state = "scheme";
-  } else if (!this.stateOverride) {
-    this.state = "no scheme";
-    --this.pointer;
-  } else {
-    this.parseError = true;
-    return failure;
-  }
+// PercentCoding modes are only used internally, they are derived from the 
+// UrlRecord's scheme and/or structure to select different encode-sets. 
 
-  return true;
-};
+const percentCodingModes =
+  { R: Symbol('regular'), S:Symbol('special'), B:Symbol('nonbase') }
 
-URLStateMachine.prototype["parse scheme"] = function parseScheme(c, cStr) {
-  if (infra.isASCIIAlphanumeric(c) || c === p("+") || c === p("-") || c === p(".")) {
-    this.buffer += cStr.toLowerCase();
-  } else if (c === p(":")) {
-    if (this.stateOverride) {
-      if (isSpecial(this.url) && !isSpecialScheme(this.buffer)) {
-        return false;
-      }
-
-      if (!isSpecial(this.url) && isSpecialScheme(this.buffer)) {
-        return false;
-      }
-
-      if ((includesCredentials(this.url) || this.url.port !== null) && this.buffer === "file") {
-        return false;
-      }
-
-      if (this.url.scheme === "file" && (this.url.host === "" || this.url.host === null)) {
-        return false;
-      }
-    }
-    this.url.scheme = this.buffer;
-    if (this.stateOverride) {
-      if (this.url.port === defaultPort(this.url.scheme)) {
-        this.url.port = null;
-      }
-      return false;
-    }
-    this.buffer = "";
-    if (this.url.scheme === "file") {
-      if (this.input[this.pointer + 1] !== p("/") || this.input[this.pointer + 2] !== p("/")) {
-        this.parseError = true;
-      }
-      this.state = "file";
-    } else if (isSpecial(this.url) && this.base !== null && this.base.scheme === this.url.scheme) {
-      this.state = "special relative or authority";
-    } else if (isSpecial(this.url)) {
-      this.state = "special authority slashes";
-    } else if (this.input[this.pointer + 1] === p("/")) {
-      this.state = "path or authority";
-      ++this.pointer;
-    } else {
-      this.url.cannotBeABaseURL = true;
-      this.url.path.push("");
-      this.state = "cannot-be-a-base-URL path";
-    }
-  } else if (!this.stateOverride) {
-    this.buffer = "";
-    this.state = "no scheme";
-    this.pointer = -1;
-  } else {
-    this.parseError = true;
-    return failure;
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse no scheme"] = function parseNoScheme(c) {
-  if (this.base === null || (this.base.cannotBeABaseURL && c !== p("#"))) {
-    return failure;
-  } else if (this.base.cannotBeABaseURL && c === p("#")) {
-    this.url.scheme = this.base.scheme;
-    this.url.path = this.base.path.slice();
-    this.url.query = this.base.query;
-    this.url.fragment = "";
-    this.url.cannotBeABaseURL = true;
-    this.state = "fragment";
-  } else if (this.base.scheme === "file") {
-    this.state = "file";
-    --this.pointer;
-  } else {
-    this.state = "relative";
-    --this.pointer;
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse special relative or authority"] = function parseSpecialRelativeOrAuthority(c) {
-  if (c === p("/") && this.input[this.pointer + 1] === p("/")) {
-    this.state = "special authority ignore slashes";
-    ++this.pointer;
-  } else {
-    this.parseError = true;
-    this.state = "relative";
-    --this.pointer;
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse path or authority"] = function parsePathOrAuthority(c) {
-  if (c === p("/")) {
-    this.state = "authority";
-  } else {
-    this.state = "path";
-    --this.pointer;
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse relative"] = function parseRelative(c) {
-  this.url.scheme = this.base.scheme;
-  if (c === p("/")) {
-    this.state = "relative slash";
-  } else if (isSpecial(this.url) && c === p("\\")) {
-    this.parseError = true;
-    this.state = "relative slash";
-  } else {
-    this.url.username = this.base.username;
-    this.url.password = this.base.password;
-    this.url.host = this.base.host;
-    this.url.port = this.base.port;
-    this.url.path = this.base.path.slice();
-    this.url.query = this.base.query;
-    if (c === p("?")) {
-      this.url.query = "";
-      this.state = "query";
-    } else if (c === p("#")) {
-      this.url.fragment = "";
-      this.state = "fragment";
-    } else if (!isNaN(c)) {
-      this.url.query = null;
-      this.url.path.pop();
-      this.state = "path";
-      --this.pointer;
-    }
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse relative slash"] = function parseRelativeSlash(c) {
-  if (isSpecial(this.url) && (c === p("/") || c === p("\\"))) {
-    if (c === p("\\")) {
-      this.parseError = true;
-    }
-    this.state = "special authority ignore slashes";
-  } else if (c === p("/")) {
-    this.state = "authority";
-  } else {
-    this.url.username = this.base.username;
-    this.url.password = this.base.password;
-    this.url.host = this.base.host;
-    this.url.port = this.base.port;
-    this.state = "path";
-    --this.pointer;
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse special authority slashes"] = function parseSpecialAuthoritySlashes(c) {
-  if (c === p("/") && this.input[this.pointer + 1] === p("/")) {
-    this.state = "special authority ignore slashes";
-    ++this.pointer;
-  } else {
-    this.parseError = true;
-    this.state = "special authority ignore slashes";
-    --this.pointer;
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse special authority ignore slashes"] = function parseSpecialAuthorityIgnoreSlashes(c) {
-  if (c !== p("/") && c !== p("\\")) {
-    this.state = "authority";
-    --this.pointer;
-  } else {
-    this.parseError = true;
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse authority"] = function parseAuthority(c, cStr) {
-  if (c === p("@")) {
-    this.parseError = true;
-    if (this.atFlag) {
-      this.buffer = "%40" + this.buffer;
-    }
-    this.atFlag = true;
-
-    // careful, this is based on buffer and has its own pointer (this.pointer != pointer) and inner chars
-    const len = countSymbols(this.buffer);
-    for (let pointer = 0; pointer < len; ++pointer) {
-      const codePoint = this.buffer.codePointAt(pointer);
-
-      if (codePoint === p(":") && !this.passwordTokenSeenFlag) {
-        this.passwordTokenSeenFlag = true;
-        continue;
-      }
-      const encodedCodePoints = utf8PercentEncodeCodePoint(codePoint, isUserinfoPercentEncode);
-      if (this.passwordTokenSeenFlag) {
-        this.url.password += encodedCodePoints;
-      } else {
-        this.url.username += encodedCodePoints;
-      }
-    }
-    this.buffer = "";
-  } else if (isNaN(c) || c === p("/") || c === p("?") || c === p("#") ||
-             (isSpecial(this.url) && c === p("\\"))) {
-    if (this.atFlag && this.buffer === "") {
-      this.parseError = true;
-      return failure;
-    }
-    this.pointer -= countSymbols(this.buffer) + 1;
-    this.buffer = "";
-    this.state = "host";
-  } else {
-    this.buffer += cStr;
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse hostname"] =
-URLStateMachine.prototype["parse host"] = function parseHostName(c, cStr) {
-  if (this.stateOverride && this.url.scheme === "file") {
-    --this.pointer;
-    this.state = "file host";
-  } else if (c === p(":") && !this.arrFlag) {
-    if (this.buffer === "") {
-      this.parseError = true;
-      return failure;
-    }
-
-    const host = parseHost(this.buffer, isNotSpecial(this.url));
-    if (host === failure) {
-      return failure;
-    }
-
-    this.url.host = host;
-    this.buffer = "";
-    this.state = "port";
-    if (this.stateOverride === "hostname") {
-      return false;
-    }
-  } else if (isNaN(c) || c === p("/") || c === p("?") || c === p("#") ||
-             (isSpecial(this.url) && c === p("\\"))) {
-    --this.pointer;
-    if (isSpecial(this.url) && this.buffer === "") {
-      this.parseError = true;
-      return failure;
-    } else if (this.stateOverride && this.buffer === "" &&
-               (includesCredentials(this.url) || this.url.port !== null)) {
-      this.parseError = true;
-      return false;
-    }
-
-    const host = parseHost(this.buffer, isNotSpecial(this.url));
-    if (host === failure) {
-      return failure;
-    }
-
-    this.url.host = host;
-    this.buffer = "";
-    this.state = "path start";
-    if (this.stateOverride) {
-      return false;
-    }
-  } else {
-    if (c === p("[")) {
-      this.arrFlag = true;
-    } else if (c === p("]")) {
-      this.arrFlag = false;
-    }
-    this.buffer += cStr;
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse port"] = function parsePort(c, cStr) {
-  if (infra.isASCIIDigit(c)) {
-    this.buffer += cStr;
-  } else if (isNaN(c) || c === p("/") || c === p("?") || c === p("#") ||
-             (isSpecial(this.url) && c === p("\\")) ||
-             this.stateOverride) {
-    if (this.buffer !== "") {
-      const port = parseInt(this.buffer);
-      if (port > Math.pow(2, 16) - 1) {
-        this.parseError = true;
-        return failure;
-      }
-      this.url.port = port === defaultPort(this.url.scheme) ? null : port;
-      this.buffer = "";
-    }
-    if (this.stateOverride) {
-      return false;
-    }
-    this.state = "path start";
-    --this.pointer;
-  } else {
-    this.parseError = true;
-    return failure;
-  }
-
-  return true;
-};
-
-const fileOtherwiseCodePoints = new Set([p("/"), p("\\"), p("?"), p("#")]);
-
-function startsWithWindowsDriveLetter(input, pointer) {
-  const length = input.length - pointer;
-  return length >= 2 &&
-    isWindowsDriveLetterCodePoints(input[pointer], input[pointer + 1]) &&
-    (length === 2 || fileOtherwiseCodePoints.has(input[pointer + 2]));
+function percentCodingModeFor (url) {
+  return isSpecial(url) ? percentCodingModes.S : 
+    url.cannotBeBase () ? percentCodingModes.B :
+    percentCodingModes.R
 }
 
-URLStateMachine.prototype["parse file"] = function parseFile(c) {
-  this.url.scheme = "file";
+// tokenTypes are used internally  by the resolve/ goto operations. 
 
-  if (c === p("/") || c === p("\\")) {
-    if (c === p("\\")) {
-      this.parseError = true;
-    }
-    this.state = "file slash";
-  } else if (this.base !== null && this.base.scheme === "file") {
-    this.url.host = this.base.host;
-    this.url.path = this.base.path.slice();
-    this.url.query = this.base.query;
-    if (c === p("?")) {
-      this.url.query = "";
-      this.state = "query";
-    } else if (c === p("#")) {
-      this.url.fragment = "";
-      this.state = "fragment";
-    } else if (!isNaN(c)) {
-      this.url.query = null;
-      if (!startsWithWindowsDriveLetter(this.input, this.pointer)) {
-        shortenPath(this.url);
-      } else {
-        this.parseError = true;
-        this.url.host = null;
-        this.url.path = [];
-      }
+const tokenTypes =
+  { scheme:1, auth:2, drive:3, pathRoot:4, dir:5, file:6, query:7, fragment:8 }
 
-      this.state = "path";
-      --this.pointer;
-    }
-  } else {
-    this.state = "path";
-    --this.pointer;
+class UrlRecord {
+
+  constructor () {
+    this.scheme = null
+    this.username = null
+    this.password = null
+    this.host = null
+    this.port = null
+    this.drive = null
+    this.pathRoot = null
+    this.dirs = []
+    this.file = null
+    this.query = null
+    this.fragment = null
   }
 
-  return true;
-};
-
-URLStateMachine.prototype["parse file slash"] = function parseFileSlash(c) {
-  if (c === p("/") || c === p("\\")) {
-    if (c === p("\\")) {
-      this.parseError = true;
-    }
-    this.state = "file host";
-  } else {
-    if (this.base !== null && this.base.scheme === "file" &&
-        !startsWithWindowsDriveLetter(this.input, this.pointer)) {
-      if (isNormalizedWindowsDriveLetterString(this.base.path[0])) {
-        this.url.path.push(this.base.path[0]);
-      } else {
-        this.url.host = this.base.host;
-      }
-    }
-    this.state = "path";
-    --this.pointer;
+  fromString (input, mode) {
+    return parseURL (input, mode)
   }
 
-  return true;
-};
-
-URLStateMachine.prototype["parse file host"] = function parseFileHost(c, cStr) {
-  if (isNaN(c) || c === p("/") || c === p("\\") || c === p("?") || c === p("#")) {
-    --this.pointer;
-    if (!this.stateOverride && isWindowsDriveLetterString(this.buffer)) {
-      this.parseError = true;
-      this.state = "path";
-    } else if (this.buffer === "") {
-      this.url.host = "";
-      if (this.stateOverride) {
-        return false;
-      }
-      this.state = "path start";
-    } else {
-      let host = parseHost(this.buffer, isNotSpecial(this.url));
-      if (host === failure) {
-        return failure;
-      }
-      if (host === "localhost") {
-        host = "";
-      }
-      this.url.host = host;
-
-      if (this.stateOverride) {
-        return false;
-      }
-
-      this.buffer = "";
-      this.state = "path start";
-    }
-  } else {
-    this.buffer += cStr;
+  toString () {
+    return serializeURL (this)
   }
 
-  return true;
-};
+  get href () {
+    return this.toString ()
+  }
 
-URLStateMachine.prototype["parse path start"] = function parsePathStart(c) {
-  if (isSpecial(this.url)) {
-    if (c === p("\\")) {
-      this.parseError = true;
-    }
-    this.state = "path";
+  get _scheme () { // lowercase scheme - for scheme comparisons
+    return this.scheme == null ? null : this.scheme.toLowerCase ()
+  }
 
-    if (c !== p("/") && c !== p("\\")) {
-      --this.pointer;
-    }
-  } else if (!this.stateOverride && c === p("?")) {
-    this.url.query = "";
-    this.state = "query";
-  } else if (!this.stateOverride && c === p("#")) {
-    this.url.fragment = "";
-    this.state = "fragment";
-  } else if (c !== undefined) {
-    this.state = "path";
-    if (c !== p("/")) {
-      --this.pointer;
+  _setAuthFromString (str) {
+    Object.assign (this, parseAuthority (str))
+    if (this.host) {
+      const _host = parseHost (this.host, !isSpecial(this))
+      if (_host === failure)
+        throw new TypeError (`Invalid hostname <${this.host}> in <${this}>`)
+      this.host = _host
     }
   }
 
-  return true;
-};
+  // ### Predicates
 
-URLStateMachine.prototype["parse path"] = function parsePath(c) {
-  if (isNaN(c) || c === p("/") || (isSpecial(this.url) && c === p("\\")) ||
-      (!this.stateOverride && (c === p("?") || c === p("#")))) {
-    if (isSpecial(this.url) && c === p("\\")) {
-      this.parseError = true;
+  hasSubstantialAuth () {
+    // This is equivalent to the authority-string being nonempty. 
+    return this.host != null && this.host !== '' ||
+      this.username != null || this.password != null || this.port != null
+  }
+
+  cannotBeBase () {
+    const { scheme, host, drive, pathRoot, file } = this
+    return host == null && !pathRoot && scheme && !(scheme in specialSchemes)
+  }
+
+  get cannotBeABaseURL () {
+    return this.cannotBeBase () // Compat
+  }
+
+  isAFragmentOnlyURL () {
+    return this.getFirstTokenType () === tokenTypes.fragment && this.fragment != null
+  }
+
+  has (key) {
+    return key === 'dir' ? this.dirs.length > 0
+      : key === 'auth' ? this.host != null
+      : this[key] != null
+  }
+
+  getFirstTokenType ({ ignoringScheme = null } = { }) {
+    for (let k in tokenTypes) if (this.has (k))
+      if (k !== 'scheme' || ignoringScheme !== this._scheme)
+        return tokenTypes[k]
+    return tokenTypes.fragment
+  }
+
+
+  // ### Validation
+
+  assertConstraints () {
+    // TODO also check root?
+    const specialHasHost = isSpecial (this) && this._scheme !== 'file' ? this.host !== '' : true
+    const passHasUser = this.password != null ? this.username != null : true
+    const fileSimpleAuth = this._scheme === 'file' ? this.username == null && this.port == null : true
+    const userPortHaveHost = this.username != null || this.port != null ? this.host != null && this.host !== '' : true
+    let portIsValid = true // just a moment,
+
+    if (this.port != null) {
+      // REVIEW should we allow storing numbers as strings? and throw here?
+      let port = this.port
+      let validIfString = true
+      if (typeof port === 'string') {
+        validIfString = /^[0-9]*$/.test (port)
+        port = +port
+      }
+      portIsValid = this.port === '' || validIfString && 0 <= port && port < 2**16
+    }
+    //log ({specialHasHost , passHasUser , fileSimpleAuth , userPortHaveHost , portIsValid})
+    if (specialHasHost && passHasUser && fileSimpleAuth && userPortHaveHost && portIsValid)
+      return this
+
+    else
+      throw new TypeError (`Invalid URL <${this}>`)
+  }
+
+
+  // ### Operations
+  
+  goto (url2) { // Returns a new UrlRecord
+    const url = new UrlRecord ()
+    const t2 = url2.getFirstTokenType ({ ignoringScheme: this._scheme })
+    for (let k in tokenTypes) {
+      const t = tokenTypes[k]
+      if (t === tokenTypes.dir) {
+        if (t < t2) url.dirs = this.dirs.slice ()
+        else if (t === t2) url.dirs = this.dirs.concat (url2.dirs)
+        else url.dirs = url2.dirs.slice ()
+      }
+      else if (t === tokenTypes.auth) {
+        const { username, password, host, port } = t < t2 ? this : url2
+        Object.assign (url, { username, password, host, port })
+      }
+      else {
+        url[k] = t < t2 ? this[k] : url2[k]
+      }
+    }
+    // Set implicit pathRoot
+    if (!this.pathRoot && (this.host != null || this.drive) && (this.dirs.length || this.file))
+      this.pathRoot = '/'
+    return url
+  }
+
+  force () { // NB Mutates
+    if (isSpecial (this)) {
+
+      if (!this.drive && !this.pathRoot)
+        this.pathRoot = '/'
+
+      if (this.hasSubstantialAuth ())
+        return this
+
+      if (this._scheme === 'file') {
+        this.host = ''
+        return this
+      } 
+
+      // Steal the authString from the first nonempty path segment
+      let i = 0, l = this.dirs.length
+      for (; i < l && this.dirs[i] === ''; i++);
+      if (i < l && this.dirs[i] !== '') {
+        const authString = this.dirs[i]
+        this.pathRoot = '/'
+        this.dirs = this.dirs.slice (i+1)
+        this._setAuthFromString (authString)
+        return this
+      }
+      if (this.host == null && this.file) {
+        const authString = this.file
+        this.dirs = []
+        this.file = null
+        this._setAuthFromString (authString)
+        return this
+      }
+      throw new TypeError (`Cannot convert <${this}> to a base URL`)
+      }
+    return this
+  }
+
+  normalize () { // Mutates
+    this.scheme = this._scheme
+    this.normalizeAuthority ()
+    this.normalizePath ()
+    return this
+  }
+
+  normalizeAuthority () { // Mutates
+    let { username, password, host, port } = this
+    if (password === '') password = null
+    if (username === '' && password === null) username = null
+    // NB note the string comparison; since we allow storing strings as well at the moment. 
+    if (port === '' || port+'' === defaultPort (this._scheme)+'') port = null 
+    if (this._scheme === 'file' && typeof host === 'string' && host.toLowerCase () === 'localhost')
+      host = ''
+    return Object.assign (this, { username, password, host, port })
+  }
+
+  normalizePath () { // Mutates
+    let { drive, pathRoot, dirs, file } = this
+    if (drive) drive = drive[0] + ':'
+    if (pathRoot) pathRoot = '/'
+
+    const normalizedDirs = []
+    for (let dir of dirs)
+      if (isDoubleDot (dir)) normalizedDirs.pop ()
+      else if (!isSingleDot (dir)) normalizedDirs.push (dir)
+
+    if (file) {
+      if (isDoubleDot(file)) {
+        normalizedDirs.pop ()
+        file = null
+      }
+      else if (isSingleDot (file))
+        file = null
     }
 
-    if (isDoubleDot(this.buffer)) {
-      shortenPath(this.url);
-      if (c !== p("/") && !(isSpecial(this.url) && c === p("\\"))) {
-        this.url.path.push("");
+    // This should possibly be part of something else, alike, assertConstraints
+    if (!pathRoot && (this.host != null || drive) && (dirs.length || file)) {
+      pathRoot = '/'
+    }
+
+    return Object.assign (this, { drive, pathRoot, dirs:normalizedDirs, file })
+  }
+
+  percentEncode () { // Mutates
+    const mode = isSpecial(this) ? percentCodingModes.S : this.cannotBeBase () ? percentCodingModes.B : percentCodingModes.R
+    for (let k in _encodedProperties) if (this.has (k)) {
+      if (k === 'dir')
+        this.dirs = this.dirs.map (_ => _encode ('dir', _, mode))
+      else if (typeof this[k] === 'string') // Hack to prevent escaping parsed host
+        this[k] = _encode (k, this[k], mode)
+    }
+    return this
+  }
+  
+}
+
+
+// ### Percent coding
+
+const _encodedProperties =
+  { username:12, password:12, /*host:9,*/ dir:6, file:6, query:3, fragment:0 }
+
+const _encode = (key, str, mode = percentCodingModes.R) =>
+  utf8PercentEncodeString (str, getPercentEncodePredicate (key, mode))
+
+function getPercentEncodePredicate (key, mode = percentCodingModes.R) {
+  if (key === 'username' || key === 'password')
+    return isUserinfoPercentEncode
+
+  if (key === 'dir' || key === 'file')
+    return mode === percentCodingModes.B ? isC0ControlPercentEncode
+      : isPathPartPercentEncode
+
+  if (key === 'query')
+    return mode === percentCodingModes.S ? isSpecialQueryPercentEncode
+      : isQueryPercentEncode
+
+  if (key === 'fragment')
+    return isFragmentPercentEncode
+
+}
+
+
+// URL parser
+// ----------
+
+const isDotOrSign = c =>
+  c === 0x2E || c === 0x2B || c === 0x2D;
+
+const isSchemeCtd = c =>
+  isAlpha (c) || isDigit (c) || isDotOrSign (c);
+
+const isStrictNonSep = c =>
+  !(c === p ('/') || c === p ('#') || c === p ('?'))
+
+const isSpecialNonSep = c =>
+  !(c === p ('/') || c === p ('\\') || c === p ('#') || c === p ('?'))
+
+const isStrictSlash = c => 
+  c === p ('/')
+
+const isSpecialSlash = c =>
+  c === p ('/') || c === p ('\\')
+
+function inputToString (input, from, to = input.length) {
+  return String.fromCodePoint (...input.slice (from, to))
+}
+
+// The new URL parser that supports relative URLs.
+// input is a list of codepoints.
+
+function URLParser (input, mode) {
+  const url = new UrlRecord // result
+  let _scheme = null        // lowerCased scheme
+  let pointer = 0           // current position
+  let c = input[pointer]    // invariant: c === input[pointer]
+  let isSlash, isNonSep     // scheme dependent codepoint predicates.
+
+  configure ()
+  this.parse = parse
+  this.parsePath = parsePath
+  this.parseScheme = parseScheme
+
+  function configure () {
+    [isSlash, isNonSep] = (_scheme in specialSchemes) || mode !== parserModes.nonSpecial
+      ? [isSpecialSlash, isSpecialNonSep]
+      : [isStrictSlash,  isStrictNonSep];
+  }
+
+  function parse () { // parse a relative (or absolute) URL
+
+    // Scheme -- possibly
+    parseScheme ()
+
+    // Reconfigure mode
+    if (url.scheme) {
+      mode = parserModeFor (url)
+      configure ()
+    }
+
+    // AuthString -- if input starts with //
+    if (isSlash (c) && isSlash (input[pointer+1])) {
+      const tokenStart = pointer + 2
+      pointer++
+      do c = input[++pointer]
+      while (c != null && isNonSep (c))
+      url.authString = inputToString (input, tokenStart, pointer)
+    }
+
+    // Root, Dirs, File
+    parsePath (false)
+
+    // Query
+    if (c === p ('?'))
+      parseQuery ()
+
+    // Fragment
+    if (c === p ('#'))
+      url.fragment = inputToString (input, pointer+1, input.length)
+    
+    // Detect drive letters
+    if (_scheme === 'file' || _scheme == null && mode === parserModes.file)
+      _detectDrive (url)
+
+    // Parse the opaque authString
+    if (url.authString != null) {
+      Object.assign (url, parseAuthority (url.authString))
+      delete url.authString
+      if (url.host) {
+        const host = parseHost (url.host, mode === parserModes.nonSpecial)
+        if (host === failure)
+          throw new TypeError (`Invalid hostname: ${url.host}`)
+        else url.host = host
       }
-    } else if (isSingleDot(this.buffer) && c !== p("/") &&
-               !(isSpecial(this.url) && c === p("\\"))) {
-      this.url.path.push("");
-    } else if (!isSingleDot(this.buffer)) {
-      if (this.url.scheme === "file" && this.url.path.length === 0 && isWindowsDriveLetterString(this.buffer)) {
-        if (this.url.host !== "" && this.url.host !== null) {
-          this.parseError = true;
-          this.url.host = "";
+    }
+    return url
+  }
+  
+
+  function parseScheme () {
+    if (isAlpha (c)) {
+      do c = input[++pointer]
+      while (isSchemeCtd (c))
+      if (c === p(':')) {
+        url.scheme = inputToString (input, 0, pointer)
+        _scheme = url.scheme.toLowerCase ()
+        c = input[++pointer]
+      }
+      else c = input[pointer = 0]
+    }
+    return url
+  }
+
+  function parsePath (standAlone = true) {
+    if (isSlash (c)) { // pathRoot
+      url.pathRoot = inputToString (input, pointer, pointer + 1)
+      c = input[++pointer]
+    }
+    if (c != null) { // dirs and file
+      let tokenStart = pointer
+      while (c != null && (standAlone || c !== p('?') && c !== p('#'))) {
+        if (isSlash (c)) {
+          url.dirs.push (inputToString (input, tokenStart, pointer))
+          tokenStart = pointer+1
         }
-        this.buffer = this.buffer[0] + ":";
+        c = input[++pointer]
       }
-      this.url.path.push(this.buffer);
+      if (tokenStart-pointer)
+        url.file = inputToString (input, tokenStart, pointer)
     }
-    this.buffer = "";
-    if (this.url.scheme === "file" && (c === undefined || c === p("?") || c === p("#"))) {
-      while (this.url.path.length > 1 && this.url.path[0] === "") {
-        this.parseError = true;
-        this.url.path.shift();
-      }
-    }
-    if (c === p("?")) {
-      this.url.query = "";
-      this.state = "query";
-    }
-    if (c === p("#")) {
-      this.url.fragment = "";
-      this.state = "fragment";
-    }
-  } else {
-    // TODO: If c is not a URL code point and not "%", parse error.
-
-    if (c === p("%") &&
-      (!infra.isASCIIHex(this.input[this.pointer + 1]) ||
-        !infra.isASCIIHex(this.input[this.pointer + 2]))) {
-      this.parseError = true;
-    }
-
-    this.buffer += utf8PercentEncodeCodePoint(c, isPathPercentEncode);
+    return url
   }
 
-  return true;
-};
-
-URLStateMachine.prototype["parse cannot-be-a-base-URL path"] = function parseCannotBeABaseURLPath(c) {
-  if (c === p("?")) {
-    this.url.query = "";
-    this.state = "query";
-  } else if (c === p("#")) {
-    this.url.fragment = "";
-    this.state = "fragment";
-  } else {
-    // TODO: Add: not a URL code point
-    if (!isNaN(c) && c !== p("%")) {
-      this.parseError = true;
-    }
-
-    if (c === p("%") &&
-        (!infra.isASCIIHex(this.input[this.pointer + 1]) ||
-         !infra.isASCIIHex(this.input[this.pointer + 2]))) {
-      this.parseError = true;
-    }
-
-    if (!isNaN(c)) {
-      this.url.path[0] += utf8PercentEncodeCodePoint(c, isC0ControlPercentEncode);
-    }
+  function parseQuery () {
+    const tokenStart = pointer+1
+    do c = input[++pointer]
+    while (c != null && c !== p('#'))
+    url.query = inputToString (input, tokenStart, pointer)
+    return url
   }
 
-  return true;
-};
+}
 
-URLStateMachine.prototype["parse query"] = function parseQuery(c) {
-  if (!isSpecial(this.url) || this.url.scheme === "ws" || this.url.scheme === "wss") {
-    this.encodingOverride = "utf-8";
-  }
+// parseUrlFromCodePoints uses _detectDrive. 
+// _detectDrive applies drive letter detection and mutates url. 
 
-  if (!this.stateOverride & c === p("#")) {
-    this.url.fragment = "";
-    this.state = "fragment";
-  } else if (!isNaN(c)) {
-    // TODO: If c is not a URL code point and not "%", parse error.
+const isDrive = str => str != null && isWindowsDriveLetterString (str)
+function _detectDrive (url) {
+  if (isDrive (url.authString))
+    [url.authString, url.drive] = ['', url.authString]
+  else if (url.dirs.length && isDrive (url.dirs[0]))
+    [url.pathRoot, url.drive] = ['/', url.dirs.shift()]
+  else if (!url.dirs.length && isDrive (url.file))
+    [url.pathRoot, url.drive, url.file] = [null, url.file, null]
+  return url
+}
 
-    if (c === p("%") &&
-      (!infra.isASCIIHex(this.input[this.pointer + 1]) ||
-        !infra.isASCIIHex(this.input[this.pointer + 2]))) {
-      this.parseError = true;
+
+// ### Authority parser
+// Notes:
+// - The last @ is the nameinfo-host separator
+// - The first : before the last @ is the username-password separator
+// - The first : after the last @ is the host-port separator
+// - username cannot contain : but may contain @
+// - pass may contain both : and @ 
+// - host cannot contain : nor @ (except, : within brackets)
+// - port cannot contain @
+
+function parseAuthority (string) {
+  let [last_at, port_col, first_col, bracks] = [-1, -1, -1, false]
+
+  for (let i=0, l=string.length; i<l; i++) {
+    const c = string [i]
+    if (c === '@') {
+      last_at = i
+      bracks = false
     }
-
-    const queryPercentEncodePredicate = isSpecial(this.url) ? isSpecialQueryPercentEncode : isQueryPercentEncode;
-    // TODO: use "percent-encode after encoding" passing in this.encodingOverride
-    this.url.query += utf8PercentEncodeCodePoint(c, queryPercentEncodePredicate);
-  }
-
-  return true;
-};
-
-URLStateMachine.prototype["parse fragment"] = function parseFragment(c) {
-  if (!isNaN(c)) {
-    // TODO: If c is not a URL code point and not "%", parse error.
-    if (c === p("%") &&
-      (!infra.isASCIIHex(this.input[this.pointer + 1]) ||
-        !infra.isASCIIHex(this.input[this.pointer + 2]))) {
-      this.parseError = true;
+    else if (c === ':') {
+      if (first_col < 0) first_col = i
+      if (port_col <= last_at && !bracks) port_col = i
     }
-
-    this.url.fragment += utf8PercentEncodeCodePoint(c, isFragmentPercentEncode);
+    else if (c === '[') bracks = true
+    else if (c === ']') bracks = false
   }
 
-  return true;
-};
+  let username = null, password = null, host = null, port = null
 
-function serializeURL(url, excludeFragment) {
-  let output = url.scheme + ":";
-  if (url.host !== null) {
-    output += "//";
-
-    if (url.username !== "" || url.password !== "") {
-      output += url.username;
-      if (url.password !== "") {
-        output += ":" + url.password;
-      }
-      output += "@";
+  if (last_at >= 0) { // has credentials
+    if (0 <= first_col && first_col < last_at) { // has password
+      username = string.substring (0, first_col)
+      password = string.substring (first_col + 1, last_at)
     }
-
-    output += serializeHost(url.host);
-
-    if (url.port !== null) {
-      output += ":" + url.port;
-    }
-  } else if (url.host === null && url.scheme === "file") {
-    output += "//";
+    else
+      username = string.substring (0, last_at)
   }
 
-  if (url.cannotBeABaseURL) {
-    output += url.path[0];
-  } else {
-    if (url.host === null && url.path.length > 1 && url.path[0] === "") {
-      output += "/.";
-    }
-    for (const segment of url.path) {
-      output += "/" + segment;
-    }
+  if (port_col > last_at) { // has port
+    host = string.substring (last_at + 1, port_col)
+    port = string.substr (port_col + 1)
+    if (/^[0-9]+$/.test (port)) port = parseInt (port, 10)
+    // Port is parsed as a number (or empty string) if valid, or as a string otherwise
   }
 
-  if (url.query !== null) {
-    output += "?" + url.query;
+  else
+    host = string.substr (last_at + 1)
+
+  return { username, password, host, port }
+}
+
+
+// ### Wrapping it all up
+
+function prepareInput (str) {
+  str = trimTabAndNewline(str);
+  str = trimControlChars(str);
+  return punycode.ucs2.decode (str);
+}
+
+function parseURL (str, mode) {
+  return new URLParser (prepareInput (str), mode) .parse ();
+}
+
+function parseAndResolveURL (urlString, baseURL = null) {
+  let resolvedURL
+  if (baseURL != null) {
+    const inputURL = parseURL (urlString, parserModeFor (baseURL))
+    if (!baseURL.cannotBeABaseURL || inputURL.isAFragmentOnlyURL ())
+      resolvedURL = baseURL.goto (inputURL)
+    else
+      resolvedURL = inputURL
+  }
+  else {
+    resolvedURL = parseURL (urlString, parserModeFor (null))
   }
 
-  if (!excludeFragment && url.fragment !== null) {
-    output += "#" + url.fragment;
-  }
+  if (!resolvedURL.scheme || resolvedURL.isAFragmentOnlyURL ())
+    throw new TypeError (`parseAndResolveURL called on relative URL string <${urlString}>`)
 
+  return resolvedURL.force () .assertConstraints () .normalize () .percentEncode ()
+}
+
+
+// URL printer
+// -----------
+
+function serializeURL (url, excludeFragment) {
+  let output = '', hasAuth = false 
+  // REVIEW (hasAuth) Disambiguate dirs starting with ['']
+  // TODO disambiguate dirs[0] if drive-letter like as well (file issue). 
+  if (url.scheme != null) output += url.scheme + ':'
+  if (url.host  != null) {
+    output += '//' + serializeAuthority (url)
+    hasAuth = true
+  }
+  if (url.drive != null) output += '/' + url.drive
+  if (url.pathRoot != null) output += '/'
+  if (!hasAuth && url.dirs.length && url.dirs[0] === '') output += './'
+  for (let dir of url.dirs) output += dir + '/'
+  if (url.file  != null) output += url.file
+  if (url.query != null) output += "?" + url.query
+  if (url.fragment != null && !excludeFragment) output += '#' + url.fragment
+  return output
+}
+
+function serializeAuthority ({ username, password, host, port }) {
+  let output = '';
+  if (username != null) output += username;
+  if (password != null) output += ':' + password;
+  if (output != '') output += '@';
+  output += serializeHost(host);
+  if (port != null) output += ':' + port;
   return output;
 }
 
-function serializeOrigin(tuple) {
-  let result = tuple.scheme + "://";
-  result += serializeHost(tuple.host);
-
-  if (tuple.port !== null) {
-    result += ":" + tuple.port;
-  }
-
+function serializeOrigin ({ scheme, host, port }) {
+  let result = scheme + "://";
+  result += serializeHost (host);
+  if (port !== null) result += ":" + port
   return result;
 }
 
-module.exports.serializeURL = serializeURL;
+function serializePath ({ drive, pathRoot, dirs, file }) {
+  let output = '';
+  if (drive) output += '/'+drive;
+  if (pathRoot) output += '/';
+  if (dirs.length) output += dirs.join ('/') + '/';
+  if (file) output += file;
+  return output;
+}
 
-module.exports.serializeURLOrigin = function (url) {
+
+// Setters
+// -------
+// These implement the setters for the legacy URL class. 
+// To be honest, these have such strange behaviour that they should not
+// be part of the core API but implemented as a compat-wrapper. 
+
+function _assign (url, patch) {
+  // Ann unpleasant trick, to pre-validate, NB mutates patch
+  Object.setPrototypeOf (patch, url)
+  try {
+    patch.assertConstraints ()
+    Object.assign (url, patch) .normalizeAuthority ()
+  }
+  catch (e) { }
+}
+
+function setTheScheme (url, str) {
+  const patch = new URLParser (prepareInput(str)) .parseScheme ()
+  if (patch.scheme && (parserModeFor (url) === parserModeFor (patch)))
+    _assign (url, { scheme:patch._scheme })
+  return url
+}
+
+function setTheUsername (url, username) {
+  username = utf8PercentEncodeString(username, isUserinfoPercentEncode);
+  _assign (url, { username });
+  return url;
+}
+
+function setThePassword (url, password) {
+  const username = url.username == null ? '' : url.username
+  password = utf8PercentEncodeString(password, isUserinfoPercentEncode);
+  _assign (url, { username, password });
+  return url;
+}
+
+function setTheHost (url, str) {
+  if (!url.cannotBeBase ()) {
+    str = '//' + trimTabAndNewline (str) + '/'
+    try {
+      let { username, host, port } = parseURL (str, parserModeFor (url))
+      if (username == null) {
+        if (!(port && (port = parsePort (port)) !== failure)) port = url.port // don't update port
+        _assign (url, { host, port })
+      }
+    } catch (e) {}
+  }
+  return url
+}
+
+// Apparently the host and hostname setter both take a non-standard
+// authority string as input, but if it constains credentials then the 
+// entire string is ignored. There's also strange rules for the presence of a port. 
+
+function setTheHostName (url, str) {
+  if (!url.cannotBeBase ()) {
+    str = trimTabAndNewline (str)
+    str = '//' + trimTabAndNewline (str) + '/'
+    try {
+      let { username, host, port } = parseURL (str, parserModeFor (url))
+      if (username == null && (port == null || url._scheme !== 'file'))
+        _assign (url, { host })
+    } catch (e) { }
+  }
+  return url
+}
+
+// a port parser used in the _setters_ only
+function parsePort (str) {
+  if (str === '') return ''
+  str = /^([0-9]*)/.exec (str) [1]
+  const port = +str
+  return (str.length && 0 <= port && port < 2**16) ? port : failure
+}
+
+function setThePort (url, portString) {
+  let port = parsePort (trimTabAndNewline (portString))
+  _assign (url, { port })
+  return url
+}
+
+function setThePathName (url, str) {
+  const input = punycode.ucs2.decode (trimTabAndNewline (str))
+  const { pathRoot:_root, drive, dirs, file } = new URLParser (input, parserModeFor (url)) .parsePath () .percentEncode ()
+  const pathRoot = url.pathRoot || _root // Setting a relative path does not unset a pathRoot if present
+  Object.assign (url, { pathRoot, drive, dirs, file }) .normalizePath () // set possible implicit pathRoot
+  return url
+}
+
+function setTheQuery (url, str) {
+  const mode = percentCodingModeFor (url)
+  str = _encode ('query', trimTabAndNewline (str), mode)
+  url.query = str
+  return url
+}
+
+function setTheFragment (url, str) {
+  const mode = percentCodingModeFor (url)
+  str = _encode ('fragment', trimTabAndNewline (str), mode)
+  url.fragment = str
+  return url
+}
+
+
+//////
+
+function serializeURLOrigin (url) {
   // https://url.spec.whatwg.org/#concept-url-origin
   switch (url.scheme) {
     case "blob":
       try {
-        return module.exports.serializeURLOrigin(module.exports.parseURL(url.path[0]));
+        return serializeURLOrigin(parseURL(url.path[0]));
       } catch (e) {
         // serializing an opaque origin returns "null"
         return "null";
@@ -1180,40 +1142,22 @@ module.exports.serializeURLOrigin = function (url) {
   }
 };
 
-module.exports.basicURLParse = function (input, options) {
-  if (options === undefined) {
-    options = {};
-  }
-
-  const usm = new URLStateMachine(input, options.baseURL, options.encodingOverride, options.url, options.stateOverride);
-  if (usm.failure) {
-    return null;
-  }
-
-  return usm.url;
-};
-
-module.exports.setTheUsername = function (url, username) {
-  url.username = utf8PercentEncodeString(username, isUserinfoPercentEncode);
-};
-
-module.exports.setThePassword = function (url, password) {
-  url.password = utf8PercentEncodeString(password, isUserinfoPercentEncode);
-};
-
-module.exports.serializeHost = serializeHost;
-
-module.exports.cannotHaveAUsernamePasswordPort = cannotHaveAUsernamePasswordPort;
-
-module.exports.serializeInteger = function (integer) {
+function serializeInteger (integer) {
   return String(integer);
-};
+}
 
-module.exports.parseURL = function (input, options) {
-  if (options === undefined) {
-    options = {};
-  }
+// function parseURL (input, options) {
+//   if (options === undefined) {
+//     options = {};
+//   }
+//
+//   // We don't handle blobs, so this just delegates:
+//   return parseAndResolveURL (input, options.baseURL)
+// }
 
-  // We don't handle blobs, so this just delegates:
-  return module.exports.basicURLParse(input, { baseURL: options.baseURL, encodingOverride: options.encodingOverride });
-};
+module.exports = {
+  UrlRecord, parserModes,
+  setTheScheme, setTheUsername, setThePassword, setTheHost, setTheHostName, setThePort, setThePathName, setTheQuery, setTheFragment,
+  serializeURL, serializeURLOrigin, serializeHost, serializeInteger, serializePath, 
+  parseAndResolveURL, parseURL, parseHost, 
+}
