@@ -1156,8 +1156,8 @@ function serializeInteger (integer) {
 // }
 
 module.exports = {
-  UrlRecord, parserModes,
+  UrlRecord,
   setTheScheme, setTheUsername, setThePassword, setTheHost, setTheHostName, setThePort, setThePathName, setTheQuery, setTheFragment,
   serializeURL, serializeURLOrigin, serializeHost, serializeInteger, serializePath, 
-  parseAndResolveURL, parseURL, parseHost, 
+  parserModes, parseAndResolveURL, parseURL, parseHost, 
 }
